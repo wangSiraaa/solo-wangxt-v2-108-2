@@ -1,6 +1,8 @@
 <script>
   import { onMount } from 'svelte';
   import RoastChart from './lib/RoastChart.svelte';
+  import PlanVersionPanel from './lib/PlanVersionPanel.svelte';
+  import PlanDeviationPanel from './lib/PlanDeviationPanel.svelte';
   import {
     getBatches,
     seed,
@@ -10,6 +12,7 @@
     listEvents,
     exportBatch,
     recompute,
+    listPlans,
     EVENT_LABELS,
     fmtTime,
   } from './lib/api.js';
@@ -24,6 +27,8 @@
   let eventHistory = [];
   let loading = '';
   let error = '';
+  let plans = [];
+  let planNotice = '';
 
   // Analysis parameters — affect DERIVED traces only, never stored samples.
   let windowS = 30;
@@ -76,6 +81,19 @@
     }
   }
 
+  async function loadPlans() {
+    try {
+      plans = await listPlans();
+    } catch (e) {
+      plans = [];
+    }
+  }
+
+  async function onPlansChanged() {
+    planNotice = '';
+    await Promise.all([loadPlans(), refresh()]);
+  }
+
   async function refresh() {
     if (!selA) return;
     loading = '加载曲线…';
@@ -89,6 +107,7 @@
     try {
       dataA = await getSeries(selA, { ...params, include_history: showHistory });
       eventHistory = await listEvents(selA, showHistory);
+      await loadPlans();
       if (view === 'compare' && selB && selB !== selA) {
         comparePayload = await getCompare(selA, selB, params);
         dataB = comparePayload.batches[1];
@@ -134,8 +153,15 @@
     loading = '保存修正…';
     error = '';
     try {
-      await addEvent(selA, body);
+      const saved = await addEvent(selA, body);
+      if (saved.plan_review?.flagged) {
+        planNotice = saved.plan_review.reason;
+      } else {
+        planNotice = '';
+      }
       await refresh();
+      // refresh() clears verifyResult; keep the banner after reload
+      if (saved.plan_review?.flagged) planNotice = saved.plan_review.reason;
     } catch (e) {
       error = e.message;
     } finally {
@@ -170,6 +196,37 @@
         recomputed: rc.metrics[k],
         match: ex.metrics[k] === rc.metrics[k],
       }));
+
+      // Plan judgement reproducibility: recompute from the EXPORTED immutable
+      // snapshot and compare every segment verdict 1:1.
+      let planRows = null;
+      let planSnapshotVersion = null;
+      const snap = ex.plan_export?.version_snapshots?.slice(-1)[0];
+      if (snap) {
+        planSnapshotVersion = `v${snap.version_no} · ${snap.status} · ${snap.content_hash.slice(0, 12)}`;
+        const rcPlan = await recompute({
+          samples: ex.series.raw_points.map((p) => ({
+            t_s: p.t_s,
+            bean_temp_c: p.bean_temp_c,
+            env_temp_c: p.env_temp_c,
+          })),
+          events: ex.events,
+          params: ex.params,
+          plan_definition: snap.definition,
+        });
+        const freshSegs = rcPlan.plan_assessment.segments;
+        const stored = ex.plan_export.assessments.slice(-1)[0]?.result;
+        const storedSegs = stored?.segments || [];
+        planRows = freshSegs.map((fs, i) => ({
+          id: fs.id,
+          exported: storedSegs[i]?.status,
+          recomputed: fs.status,
+          match: storedSegs[i]?.status === fs.status
+            && storedSegs[i]?.observed_duration_s === fs.observed_duration_s,
+          reason: fs.reason_zh || '',
+        }));
+      }
+
       // Changing window/smoothing must leave every stored sample untouched.
       const alt = await getSeries(selA, {
         window_s: windowS * 2,
@@ -179,7 +236,7 @@
       const sig = (arr) =>
         JSON.stringify(arr.map((p) => [p.t_s, p.bean_temp_c, p.env_temp_c]));
       const rawSame = sig(ex.series.raw_points) === sig(alt.series.raw_points);
-      verifyResult = { rows, rawSame, exportObj: ex };
+      verifyResult = { rows, planRows, planSnapshotVersion, rawSame, exportObj: ex };
     } catch (e) {
       error = e.message;
     } finally {
@@ -313,6 +370,12 @@
 
   {#if dataA}
     <section class="panel">
+      {#if dataA.plan?.assessment?.review_state === 'needs_review' || planNotice}
+        <div class="warn" style="margin-bottom:8px">
+          ⚠ <b>方案判断需要重新审阅：</b>
+          {dataA.plan?.assessment?.needs_review_reason || planNotice}
+        </div>
+      {/if}
       <RoastChart {chartPayloads} {windowS} {smoothS} />
       <div class="row" style="margin-top:6px;font-size:12px">
         <span class="tag">圆点＝实测豆温</span>
@@ -320,6 +383,11 @@
         <span class="tag">细点线＝环境温度</span>
         <span class="tag">金色竖虚线＝风门变化</span>
         <span class="tag">曲线断档＝缺测未桥接</span>
+        {#if dataA.plan?.assessment}
+          <span class="tag" style="color:#efe7dd;border-color:#888">白色长虚线＝方案目标（按该批锚点对齐）</span>
+          <span class="tag" style="color:#5fd08a;border-color:#2f6b45">点线＝容差带沿</span>
+          <span class="tag" style="color:#c3b6a6;border-color:#4a423a">灰色段背景＝未评估（缺锚点/跨长断档）</span>
+        {/if}
       </div>
       {#if comparePayload}
         <div class="warn" style="margin-top:8px">{comparePayload.interpretation}</div>
@@ -428,8 +496,29 @@
       </div>
     </section>
 
+    <section class="row">
+      <div class="panel col">
+        <h2>烘焙方案版本 · 不可变版本与批次绑定</h2>
+        <PlanVersionPanel
+          {plans}
+          batchId={selA}
+          batchPlanBlock={dataA.plan}
+          on:changed={onPlansChanged}
+        />
+      </div>
+
+      <div class="panel col">
+        <h2>方案偏差审阅（按锚点对齐 · 容差带）</h2>
+        <PlanDeviationPanel
+          batchId={selA}
+          block={dataA.plan}
+          on:changed={onPlansChanged}
+        />
+      </div>
+    </section>
+
     <section class="panel">
-      <h2>缺测与插值审计 · 导出可复现</h2>
+      <h2>缺测与插值审计 · 导出可复现（含方案快照）</h2>
       <div class="row">
         <div style="flex:1;min-width:280px">
           <table>
@@ -460,7 +549,7 @@
         </div>
         <div style="flex:1;min-width:280px">
           <button on:click={verifyExport}>
-            ② 导出 JSON 并用 /api/recompute 重算全部阶段指标
+            ② 导出 JSON（携带方案版本快照）并用 /api/recompute 重算指标与方案判断
           </button>
           {#if verifyResult}
             <table style="margin-top:10px">
@@ -474,6 +563,30 @@
                 </tr>
               {/each}
             </table>
+            {#if verifyResult.planRows}
+              <div style="margin-top:10px">
+                <b>方案判断复现</b>
+                <span class="muted" style="font-size:12px">
+                  （依据导出内不可变快照 {verifyResult.planSnapshotVersion}）
+                </span>
+                <table style="margin-top:4px">
+                  <tr><th>目标段</th><th>导出结论</th><th>快照重算</th><th>一致</th><th>未评估原因</th></tr>
+                  {#each verifyResult.planRows as r}
+                    <tr>
+                      <td>{r.id}</td>
+                      <td>{r.exported ?? '—'}</td>
+                      <td>{r.recomputed ?? '—'}</td>
+                      <td>{r.match ? '✅' : '❌'}</td>
+                      <td class="muted" style="font-size:11px;max-width:300px">{r.reason || ''}</td>
+                    </tr>
+                  {/each}
+                </table>
+              </div>
+            {:else}
+              <div class="muted" style="margin-top:6px;font-size:12px">
+                本批次尚未绑定方案版本：导出包含原始数据与事件，方案快照将在绑定后随导出携带。
+              </div>
+            {/if}
             <div style="margin-top:8px">
               <span class="{verifyResult.rawSame ? '' : 'warn'}">
                 改变窗口/平滑后原始豆温/环温逐点比对：

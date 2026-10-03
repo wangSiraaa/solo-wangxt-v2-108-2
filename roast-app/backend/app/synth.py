@@ -184,3 +184,41 @@ def two_demo_batches() -> list[dict]:
             damper_t=None,  # no damper change: control for comparison
         ),
     ]
+
+
+# A confirmed-worthy demo plan fitted to the two synthetic batches above.
+# Targets sit near BOTH batches' observed values (wide tolerances), while the
+# maillard segment deliberately spans the ~424-480 s long probe gap so the UI
+# can show an honest "unevaluable" segment instead of a fabricated pass.
+def demo_plan_definition() -> dict:
+    return {
+        "segments": [
+            {
+                "id": "drying",
+                "from_anchor": "charge",
+                "to_anchor": "turning_point",
+                "target_duration_s": 50,
+                "duration_tolerance_s": 25,
+                "end_temp_c": 106,
+                "end_temp_tolerance_c": 12,
+            },
+            {
+                "id": "maillard",
+                "from_anchor": "turning_point",
+                "to_anchor": "first_crack_start",
+                "target_duration_s": 435,
+                "duration_tolerance_s": 30,
+                "end_temp_c": 192,
+                "end_temp_tolerance_c": 10,
+            },
+            {
+                "id": "development",
+                "from_anchor": "first_crack_start",
+                "to_anchor": "drop",
+                "target_duration_s": 120,
+                "duration_tolerance_s": 30,
+                "end_temp_c": 202,
+                "end_temp_tolerance_c": 8,
+            },
+        ]
+    }

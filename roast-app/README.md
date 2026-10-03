@@ -3,6 +3,37 @@
 面向烘焙负责人的**过程记录**工具：并排查看豆温、环境温度与操作事件（回温点、一爆、风门变化、出锅），
 而不是用成品评分替代过程。系统**不连接真实烘焙机**，数据来自带噪声、不均采样与探针失联的合成生成器。
 
+## 烘焙方案版本（roast plan versions）
+
+在批次/事件/双批次对比之上新增一套**可复审、不可变**的目标曲线方案：
+
+- **方案定义**：目标段完全相对已定义锚点定位——`charge → turning_point →
+  first_crack_start → drop`，对应脱水/梅纳/发展三段；每段有目标时长 ±容差，
+  可选段末温度 ±容差与段内曲线点 ±容差。定义经规范化 JSON + SHA-256 内容哈希。
+- **状态机（严格线性）**：`draft 草稿 → confirmed 已确认 → retired 退役`。
+  已确认/退役版本的定义**只不可变**：没有任何接口改写其内容；调整目标只能
+  “基于某版本创建新版本”，确认新版本自动退役旧版本。
+- **批次绑定**：只能绑定**已确认**版本；绑定是只追加行（改绑新版本插入新行、
+  旧行置 superseded 并保留）。`series/export` 内嵌的是**版本快照**，因此旧批次
+  与旧导出永远指向当时的判断依据。
+- **偏差结论持久化（append-only）**：`plan_assessments` 保存总体判定、逐段
+  pass/fail/unevaluable、锚点依据、取证口径与内容哈希。重算生成新行并将旧行
+  置 `superseded`；**手工修正锚点事件**（charge/TP/FC/drop）后当前结论被标为
+  `needs_review`（不覆盖），历史结论与依据仍可在历史接口/界面回看。
+- **双编辑端冲突显式化**：同一旧版本被两个编辑端派生时，后到提交得到
+  `409 version_conflict` 且不写入；同一草稿的并发保存用 `expected_revision`
+  做原子乐观锁（条件 UPDATE + 唯一约束），后到者得到 `409 draft_revision_conflict`。
+- **诚实判定**：缺少边界锚点 → 该段 `unevaluable`（含 `missing_anchor` 原因）；
+  目标段跨越超过桥接上限的长缺测 → 该段 `unevaluable`（`crosses_wide_unfilled_gap`）；
+  温度检查时刻 ±8s 内只有插值点（非实测）→ 该检查 `unevaluable`
+  （`only_interpolated_in_window`）。**相邻插值永不计为通过依据，缺测永不补造
+  达标结论。** 所有结论附声明：过程偏差不构成因果或成品质量结论。
+
+页面“烘焙方案版本”面板可建草稿/确认/退役/绑定，并内置两个独立编辑端演示
+验收④；“方案偏差审阅”面板按锚点对齐逐段展示偏差与容差，图表叠加锚点对齐
+目标曲线、容差带与按判定着色的段背景；导出面板用导出内快照经 `/api/recompute`
+逐段复现同一判断。
+
 ## 技术栈
 
 | 层 | 选型 |
@@ -70,6 +101,25 @@
 打开页面后点 **① 生成两个合成批次**：A 批在 300 s 有关一次风门（70%→40%），B 批无风门变化，
 两批均含测量噪声、不均采样、一次短失联（5 s，插值桥接）和一次长失联（56 s，断档不桥接）。
 
+再点 **③ 生成并绑定演示烘焙方案（已确认版本）**：自动创建一个已确认方案
+`DEMO-PLAN-2026-09` 并把两个演示批次绑定到它、生成初始偏差结论。梅纳段
+（约 54–480 s）刻意跨越 ~424–480 s 的长缺测，因此该段显示**未评估**而非通过。
+
+### 手工验证五项验收
+
+1. **绑定即逐段偏差 + 导出复现**：③ 后，曲线按锚点叠加白色虚线目标与容差带，
+   “方案偏差审阅”表逐段给出实际/目标/偏差/容差/状态；导出面板逐段复现同一判定。
+2. **新版本只向前生效**：在“两个编辑端”卡片（或时间线）基于已确认版本改目标
+   → 得到新草稿 → 确认；把批次 B 绑到新版本，批次 A 的图表、结论与已下载的
+   旧导出仍是 v1（`GET /api/batches/{a}/series` 的 `plan.version_snapshot`）。
+3. **一爆缺失/长断档未评估**：删除/不录入 `first_crack_start` 后重算，梅纳/发展
+   两段显示未评估及原因；梅纳跨长缺测段同样未评估，相邻插值不作为通过依据。
+4. **双端版本冲突**：编辑端 A 与编辑端 B 都基于同一旧版本提交不同改动，B 得到
+   显式 409 且其内容不落库；点“同步到最新基础版本”后才能合并重提。
+5. **锚点修正 → 需要重新审阅**：在“人工修正事件”中改回温点/一爆/drop 时间，
+   当前方案判断被标 `needs_review`（页面顶部横幅），历史判断与依据可在
+   “查看历史判断/绑定”中回看；点重算后旧行置 superseded、新行为 current。
+
 ### 方式二：docker compose
 
     docker compose up --build
@@ -81,8 +131,10 @@
     DATABASE_URL=postgresql+psycopg2://roast:roast@localhost:5432/roast pytest
 
 界面“缺测与插值审计 · 导出可复现”面板一键完成：
-1. 导出 JSON（原始采样 + 全量事件含已取代行 + 参数 + 阶段指标）；
-2. 调 `/api/recompute` 从原始数据独立重算，逐指标比对（脱水/梅纳/发展/一爆/总时长/DTR）；
+1. 导出 JSON（原始采样 + 全量事件含已取代行 + 参数 + 阶段指标
+   **+ 已绑定方案的不可变版本快照与全部偏差结论**）；
+2. 调 `/api/recompute` 从原始数据独立重算，逐指标比对（脱水/梅纳/发展/一爆/总时长/DTR），
+   并在携带 `plan_definition` 时**逐段复现同一方案判定（含未评估原因）**；
 3. 再用翻倍窗口、不同平滑重取曲线，逐点比对原始豆温/环温**完全不变**。
 
 ## API 摘要
@@ -91,14 +143,31 @@
 |---|---|---|
 | GET | `/api/batches` | 批次列表 |
 | POST | `/api/seed` | 生成两个合成批次 |
-| GET | `/api/batches/{id}/series?window_s&display_smooth_s&max_gap_fill_s` | 曲线+RoR+指标 |
-| GET/POST | `/api/batches/{id}/events[?include_history=true]` | 事件列表/人工修正（只追加） |
+| GET | `/api/batches/{id}/series?...` | 曲线+RoR+指标（绑定后含 `plan` 快照+结论） |
+| GET/POST | `/api/batches/{id}/events[?include_history=true]` | 事件列表/人工修正（只追加；锚点修正返回 `plan_review` 标记） |
 | GET | `/api/compare?a=&b=` | 双批次叠加（含非因果声明） |
-| GET | `/api/batches/{id}/export` | 自包含导出 |
-| POST | `/api/recompute` | 从导出载荷独立重算全部派生指标 |
+| GET | `/api/batches/{id}/export` | 自包含导出（v2，含 `plan_export` 快照与全部结论） |
+| POST | `/api/recompute` | 从导出载荷独立重算指标（+可选方案逐段判定） |
+| POST/GET | `/api/plans` | 建方案(含 v1 草稿) / 方案与版本链列表 |
+| GET | `/api/plans/{id}` `/api/plans/{id}/versions/{vid}` | 方案 / 单个版本（只读） |
+| POST | `/api/plans/{id}/versions` | 基于已确认/退役版本派生**新草稿**（409 版本冲突） |
+| PATCH | `/api/plans/{id}/versions/{vid}` | 编辑开放草稿（`expected_revision` 乐观锁，409 草稿冲突） |
+| POST | `/api/plans/{id}/versions/{vid}/confirm` `/retire` | 草稿→已确认（旧确认版自动退役）/ 已确认→退役 |
+| PUT/GET | `/api/batches/{id}/plan-binding` | 绑定（仅已确认版本，改绑保留旧行）/ 当前绑定 |
+| GET | `/api/batches/{id}/plan-binding/history` | 绑定历史（含已取代行） |
+| POST/GET | `/api/batches/{id}/plan-assessment[s]` | 重算并持久化 / 当前结论（current 或 needs_review） |
+| GET | `/api/batches/{id}/plan-assessment/history` | 全部历史结论（含 superseded，依据可回看） |
+| POST | `/api/seed-demo-plan` | 演示：创建并确认 DEMO 方案、绑定两个演示批次 |
 
 ## 目录
 
-    backend/app/  config.py models.py analysis.py synth.py schemas.py main.py
-    frontend/src/ App.svelte lib/RoastChart.svelte lib/api.js
-    tests/        test_analysis.py test_api.py（双后端同一套用例）
+    backend/app/  config.py models.py analysis.py plans.py plan_api.py
+                  synth.py schemas.py main.py
+    frontend/src/ App.svelte lib/RoastChart.svelte lib/PlanVersionPanel.svelte
+                  lib/PlanDeviationPanel.svelte lib/api.js
+    tests/        test_analysis.py test_api.py test_plan_versions.py
+                  （双后端同一套用例）
+
+纯计算与判定口径在 `app/plans.py`（方案规范化/哈希/锚点对齐评估）与
+`app/analysis.py`（RoR/插值/阶段指标），均为无副作用纯函数；状态机与
+持久化在 `app/plan_api.py`。

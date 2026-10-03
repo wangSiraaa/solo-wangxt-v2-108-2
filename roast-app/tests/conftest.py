@@ -20,10 +20,13 @@ from app import models  # noqa: E402
 from app.main import app  # noqa: E402
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture()
 def client():
-    # deterministic start: recreate every table
-    models.Base.metadata.drop_all(models.engine)
-    models.Base.metadata.create_all(models.engine)
+    # Each test gets a deterministic, freshly recreated schema so anchor
+    # corrections / event deletions in one test cannot pollute another.
+    # The app's startup hook only runs create_all (no-op once tables exist),
+    # so recreate here while no server lifespan is active.
     with TestClient(app) as c:
+        models.Base.metadata.drop_all(models.engine)
+        models.Base.metadata.create_all(models.engine)
         yield c

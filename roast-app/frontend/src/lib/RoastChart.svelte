@@ -20,6 +20,16 @@
   let chart;
 
   const PALETTE = ['#e07a3f', '#4aa3df'];
+  const SEG_STATUS_COLOR = {
+    pass: '#5fd08a',
+    fail: '#e35d5d',
+    unevaluable: '#a89b8c',
+  };
+  const SEG_STATUS_TEXT = {
+    pass: '在容差内',
+    fail: '超出容差',
+    unevaluable: '未评估',
+  };
   const EVENT_STYLE = {
     charge: { color: '#9a9a9a' },
     turning_point: { color: '#5fd08a' },
@@ -170,6 +180,90 @@
           },
         }))
       );
+      // ---- plan target overlay (anchor-aligned) ------------------------
+      const assessment = pl.plan?.assessment?.result || pl.plan_assessment;
+      if (assessment) {
+        const segById = Object.fromEntries(
+          assessment.segments.map((sg) => [sg.id, sg])
+        );
+        const mapped = assessment.target_curve?.mapped || [];
+        const markAreas = [];
+        mapped.forEach((m) => {
+          const sg = segById[m.id];
+          if (!sg || !m.points || m.points.length < 2) return;
+          const t0 = m.points[0][0];
+          const t1 = m.points[m.points.length - 1][0];
+          const color = SEG_STATUS_COLOR[sg.status] || '#a89b8c';
+          // Segment backdrop tinted by verdict. Unevaluable stays grey and is
+          // never green — a missing-anchor/gap segment cannot look "fine".
+          markAreas.push([
+            {
+              xAxis: t0,
+              itemStyle: { color, opacity: sg.status === 'unevaluable' ? 0.06 : 0.09 },
+            },
+            {
+              xAxis: t1,
+              label: {
+                show: true,
+                position: 'insideTop',
+                color,
+                fontSize: 10,
+                formatter: `方案·${{ drying: '脱水', maillard: '梅纳', development: '发展' }[m.id] || m.id}: ${SEG_STATUS_TEXT[sg.status]}`,
+              },
+            },
+          ]);
+
+          if (sg.status !== 'unevaluable') {
+            // tolerance envelope: upper/lower boundaries dotted in the verdict
+            // colour. A fill between them cannot be expressed simply without a
+            // stack, so we draw both edges explicitly (label: 容差带).
+            series.push({
+              name: '容差带上沿',
+              type: 'line',
+              data: m.band.map((p) => [p[0], p[2]]),
+              showSymbol: false,
+              lineStyle: { width: 1, color, opacity: 0.55, type: 'dotted' },
+              xAxisIndex: 0,
+              yAxisIndex: 0,
+              z: 5,
+              tooltip: { show: false },
+              legendHoverLink: false,
+            });
+            series.push({
+              name: '容差带下沿',
+              type: 'line',
+              data: m.band.map((p) => [p[0], p[1]]),
+              showSymbol: false,
+              lineStyle: { width: 1, color, opacity: 0.55, type: 'dotted' },
+              xAxisIndex: 0,
+              yAxisIndex: 0,
+              z: 5,
+              tooltip: { show: false },
+              legendHoverLink: false,
+            });
+            // the anchor-aligned target line itself
+            series.push({
+              name: bi === 0 ? '方案目标曲线(锚点对齐)' : `方案目标 ${pl.batch.name}`,
+              type: 'line',
+              data: m.points,
+              showSymbol: false,
+              lineStyle: { width: 2, color: '#efe7dd', type: 'dashed' },
+              itemStyle: { color: '#efe7dd' },
+              xAxisIndex: 0,
+              yAxisIndex: 0,
+              z: 6,
+            });
+          }
+        });
+        if (markAreas.length) {
+          scatterSpec.markArea = {
+            silent: true,
+            itemStyle: { borderWidth: 0 },
+            data: markAreas,
+          };
+        }
+      }
+
       const target = scatterSpec;
       target.markLine = {
         silent: false,
@@ -177,6 +271,12 @@
         data: markLines,
       };
     });
+
+    const hasPlan = payloads.some(
+      (pl) => pl.plan?.assessment?.result || pl.plan_assessment
+    );
+    const legendData = ['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR'];
+    if (hasPlan) legendData.push('方案目标曲线(锚点对齐)', '容差带上沿');
 
     return {
       backgroundColor: 'transparent',
@@ -189,7 +289,7 @@
         valueFormatter: (v) => (v === null || v === undefined ? '缺测' : Number(v).toFixed(1)),
       },
       legend: {
-        data: ['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR'],
+        data: legendData,
         textStyle: { color: '#a89b8c' },
         top: 0,
       },

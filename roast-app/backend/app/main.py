@@ -9,19 +9,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import synth
+from . import plan_api, synth
 from .analysis import RoRConfig, build_series, current_events, phase_metrics
 from .config import CORS_ORIGINS, MAX_GAP_FILL_S
-from .models import Batch, Event, Sample, engine, init_db
+from .models import ASSESSMENT_NEEDS_REVIEW, Batch, Event, Sample, engine, init_db
 from .schemas import BatchMeta, EventIn, EventOut
 
-app = FastAPI(title="Coffee Roast Batch Explorer", version="1.0.0")
+app = FastAPI(title="Coffee Roast Batch Explorer", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(plan_api.router)
 
 
 @app.on_event("startup")
@@ -77,6 +78,7 @@ def _events_as_dicts(batch: Batch, *, include_history: bool) -> list[dict]:
 
 def _series_payload(
     batch: Batch,
+    session: Session,
     *,
     window_s: float,
     display_smooth_s: float,
@@ -89,7 +91,7 @@ def _series_payload(
         max_gap_fill_s=max_gap_fill_s,
     )
     events = _events_as_dicts(batch, include_history=include_history)
-    return {
+    payload = {
         "batch": BatchMeta.model_validate(batch).model_dump(mode="json"),
         "series": series,
         "events": events,
@@ -101,6 +103,45 @@ def _series_payload(
             "raw_is_immutable": True,
         },
     }
+    payload["plan"] = _plan_block(session, batch)
+    return payload
+
+
+def _plan_block(session: Session, batch: Batch) -> dict[str, Any] | None:
+    """Binding + immutable version snapshot + latest persistent judgement.
+
+    The version definition is embedded as a SNAPSHOT: later edits/new versions
+    never mutate what an already-bound batch or an old export was judged with.
+    """
+    binding = plan_api.current_binding(session, batch.id)
+    if binding is None:
+        return None
+    version = session.get(plan_api.RoastPlanVersion, binding.plan_version_id)
+    plan = session.get(plan_api.RoastPlan, version.plan_id)
+    assessment = plan_api.current_assessment(session, batch.id)
+    block = {
+        "binding": {
+            "id": binding.id,
+            "plan_version_id": binding.plan_version_id,
+            "bound_by": binding.bound_by,
+            "note": binding.note,
+            "created_at": binding.created_at.isoformat(),
+        },
+        "version_snapshot": {
+            "plan_id": plan.id,
+            "plan_name": plan.name,
+            "version_id": version.id,
+            "version_no": version.version_no,
+            "status": version.status,
+            "content_hash": version.content_hash,
+            "definition": plan_api._definition(version),
+            "confirmed_at": version.confirmed_at.isoformat() if version.confirmed_at else None,
+            "snapshot_note": "已确认版本内容不可变；本快照即该批次判断依据，不随后续版本修改。",
+        },
+        "assessment": plan_api.assessment_out(assessment) if assessment else None,
+        "disclaimer": plan_api.plan_lib.NON_CAUSAL_DISCLAIMER,
+    }
+    return block
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +203,7 @@ def get_series(
         b = _get_batch(s, batch_id)
         return _series_payload(
             b,
+            s,
             window_s=window_s,
             display_smooth_s=display_smooth_s,
             max_gap_fill_s=max_gap_fill_s,
@@ -173,8 +215,8 @@ def get_series(
 # events: append-only corrections with provenance
 # ---------------------------------------------------------------------------
 
-@app.post("/api/batches/{batch_id}/events", response_model=EventOut)
-def add_event(batch_id: int, ev: EventIn) -> Event:
+@app.post("/api/batches/{batch_id}/events")
+def add_event(batch_id: int, ev: EventIn) -> dict[str, Any]:
     with Session(engine) as s:
         _get_batch(s, batch_id)
         row = Event(batch_id=batch_id, **ev.model_dump())
@@ -193,9 +235,24 @@ def add_event(batch_id: int, ev: EventIn) -> Event:
             for p in prev:
                 p.superseded = True
                 p.superseded_by_id = row.id
+        # Anchor corrections invalidate plan judgements: flag, don't overwrite.
+        flagged = plan_api.mark_stale_for_anchor_event(
+            s, batch_id, row.event_type, row.t_s
+        )
         s.commit()
         s.refresh(row)
-        return row
+        out = EventOut.model_validate(row).model_dump(mode="json")
+        if flagged:
+            stale = flagged[0]
+            out["plan_review"] = {
+                "flagged": True,
+                "review_state": ASSESSMENT_NEEDS_REVIEW,
+                "reason": stale.needs_review_reason,
+                "assessment_id": stale.id,
+            }
+        else:
+            out["plan_review"] = {"flagged": False}
+        return out
 
 
 @app.get("/api/batches/{batch_id}/events", response_model=list[EventOut])
@@ -229,6 +286,7 @@ def compare(
             "batches": [
                 _series_payload(
                     ba,
+                    s,
                     window_s=window_s,
                     display_smooth_s=display_smooth_s,
                     max_gap_fill_s=max_gap_fill_s,
@@ -236,6 +294,7 @@ def compare(
                 ),
                 _series_payload(
                     bb,
+                    s,
                     window_s=window_s,
                     display_smooth_s=display_smooth_s,
                     max_gap_fill_s=max_gap_fill_s,
@@ -259,26 +318,85 @@ def export_batch(batch_id: int, window_s: float = 30.0, display_smooth_s: float 
         b = _get_batch(s, batch_id)
         payload = _series_payload(
             b,
+            s,
             window_s=window_s,
             display_smooth_s=display_smooth_s,
             max_gap_fill_s=MAX_GAP_FILL_S,
             include_history=True,
         )
-        payload["export_version"] = 1
+        # Export carries the full plan SNAPSHOT plus every stored judgement
+        # (including needs_review / superseded rows) so a third party can
+        # reproduce exactly the verdict the batch was bound to, even after the
+        # plan gains newer versions or the anchor events are corrected.
+        binding = plan_api.current_binding(s, batch_id)
+        from sqlalchemy import select as _select
+        assessments = list(
+            s.scalars(
+                _select(plan_api.PlanAssessment)
+                .where(plan_api.PlanAssessment.batch_id == batch_id)
+                .order_by(plan_api.PlanAssessment.id)
+            )
+        )
+        bindings = list(
+            s.scalars(
+                _select(plan_api.BatchPlanBinding)
+                .where(plan_api.BatchPlanBinding.batch_id == batch_id)
+                .order_by(plan_api.BatchPlanBinding.id)
+            )
+        )
+        plan_export = None
+        if bindings:
+            plan_export = {
+                "current_binding_id": binding.id if binding else None,
+                "bindings": [
+                    {
+                        "id": r.id,
+                        "plan_version_id": r.plan_version_id,
+                        "bound_by": r.bound_by,
+                        "note": r.note,
+                        "superseded": r.superseded,
+                        "created_at": r.created_at.isoformat(),
+                    }
+                    for r in bindings
+                ],
+                "version_snapshots": [
+                    plan_api.version_out(s.get(plan_api.RoastPlanVersion, r.plan_version_id))
+                    for r in bindings
+                ],
+                "assessments": [plan_api.assessment_out(r) for r in assessments],
+                "reproducibility": {
+                    "definition_is_immutable_snapshot": True,
+                    "assessment_hash_algorithm": "sha256(canonical_json(result))",
+                    "recompute_endpoint": "/api/recompute",
+                },
+                "disclaimer": plan_api.plan_lib.NON_CAUSAL_DISCLAIMER,
+            }
+        payload["export_version"] = 2
+        payload["plan_export"] = plan_export
         payload["reproducibility"] = {
             "raw_samples_are_source_of_truth": True,
             "metrics_depend_on": ["raw_samples", "current(non-superseded) events", "ror_window_s"],
             "pipeline": "numpy centred least-squares RoR; linear gap fill flagged",
+            "plan_judgement_depends_on": [
+                "raw_samples",
+                "current anchor events",
+                "immutable plan version snapshot",
+                "max_gap_fill_s",
+            ],
         }
         return payload
 
 
 @app.post("/api/recompute")
 def recompute(payload: dict[str, Any]) -> dict[str, Any]:
-    """Re-derive series + metrics from an export-style payload.
+    """Re-derive series + metrics (+ plan judgement) from an export payload.
 
-    Used to verify an export reproduces every stage metric without touching
-    the database.  Body: {"samples": [...], "events": [...], "params": {...}}.
+    Used to verify an export reproduces every stage metric and every plan
+    segment verdict without touching the database.  Body::
+
+        {"samples": [...], "events": [...], "params": {...},
+         "plan_definition": {...}          # optional, from the version snapshot
+        }
     """
     try:
         samples = payload["samples"]
@@ -290,16 +408,25 @@ def recompute(payload: dict[str, Any]) -> dict[str, Any]:
         window_s=float(params.get("ror_window_s", 30.0)),
         display_smooth_s=float(params.get("ror_display_smooth_s", 12.0)),
     )
-    series = build_series(
-        samples,
-        ror_cfg=cfg,
-        max_gap_fill_s=float(params.get("max_gap_fill_s", MAX_GAP_FILL_S)),
-    )
-    return {
+    max_gap = float(params.get("max_gap_fill_s", MAX_GAP_FILL_S))
+    series = build_series(samples, ror_cfg=cfg, max_gap_fill_s=max_gap)
+    out = {
         "series": series,
         "metrics": phase_metrics(events),
         "current_events": current_events(events),
     }
+    definition = payload.get("plan_definition")
+    if definition is not None:
+        from . import plans as plan_lib
+        result = plan_lib.evaluate_plan(
+            definition,
+            plan_lib.attach_guide(series["raw_points"], series["guide_bean_temp"]),
+            events,
+            max_gap_fill_s=max_gap,
+            missing_segments=series["missing_segments"],
+        )
+        out["plan_assessment"] = result
+    return out
 
 
 @app.get("/api/health")
