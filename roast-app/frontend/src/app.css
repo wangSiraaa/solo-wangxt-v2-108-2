@@ -66,3 +66,19 @@ label.inline { display: inline-flex; align-items: center; gap: 6px; margin-right
   padding: 8px 12px;
   font-size: 13px;
 }
+/* plan status / verdict colors */
+.tag.confirmed, .tag.ok { color: #5fd08a; border-color: #2e5e40; }
+.tag.retired { color: #a89b8c; border-color: #4a423b; }
+.tag.draft, .tag.neutral { color: #8fc0e8; border-color: #33506b; }
+.tag.bad { color: #e35d5d; border-color: #6b2e2e; }
+.ok { color: #5fd08a; }
+.bad { color: #e35d5d; }
+.neutral { color: #a89b8c; }
+textarea {
+  background: #241f1a;
+  color: #d8cfc3;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+h3 { font-size: 13px; color: var(--muted); margin: 0; }

@@ -27,3 +27,18 @@ def client():
     models.Base.metadata.create_all(models.engine)
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture()
+def fresh_db():
+    """Function-scoped empty schema on the configured engine.
+
+    The plan/version lifecycle tests bind the same batch ids repeatedly;
+    sharing rows across tests would make them order-dependent, so each test
+    using this fixture starts from an empty database.
+    """
+    models.Base.metadata.drop_all(models.engine)
+    models.Base.metadata.create_all(models.engine)
+    yield models.engine
+    models.Base.metadata.drop_all(models.engine)
+    models.Base.metadata.create_all(models.engine)

@@ -20,6 +20,8 @@
   let chart;
 
   const PALETTE = ['#e07a3f', '#4aa3df'];
+  const BAND_COLOR = '#7f6fd6';
+  const TARGET_COLOR = '#b5a8ff';
   const EVENT_STYLE = {
     charge: { color: '#9a9a9a' },
     turning_point: { color: '#5fd08a' },
@@ -176,6 +178,72 @@
         symbol: 'none',
         data: markLines,
       };
+
+      // Bound plan overlay: anchor-aligned target segments with ±tolerance
+      // bands.  Bands are drawn for EVERY segment, including unevaluated ones
+      // (they stay a reference, not a judgment); the deviation table carries
+      // the per-segment verdict and the reason it could not be judged.
+      const evalResult = pl.plan?.current_evaluation?.result;
+      if (evalResult) {
+        const segShade = (verdict) =>
+          verdict === 'within_tolerance'
+            ? 'rgba(95,208,138,0.10)'
+            : verdict === 'outside_tolerance'
+              ? 'rgba(227,93,93,0.12)'
+              : 'rgba(168,155,140,0.10)';
+        evalResult.segments.forEach((seg) => {
+          if (!seg.tolerance_band) return;
+          const lower = seg.tolerance_band.map((pt) => [pt.t_s, pt.lower_c]);
+          // stacked transparent base + band-height layer
+          const upper = seg.tolerance_band.map((pt) => [
+            pt.t_s,
+            pt.upper_c - pt.lower_c,
+          ]);
+          series.push({
+            name: '容差带',
+            type: 'line',
+            data: lower,
+            showSymbol: false,
+            lineStyle: { opacity: 0 },
+            stack: `band-${bi}-${seg.key}`,
+            xAxisIndex: 0,
+            yAxisIndex: 0,
+            z: 1,
+            silent: true,
+            legendHoverLink: false,
+            tooltip: { show: false },
+          });
+          series.push({
+            name: '容差带',
+            type: 'line',
+            data: upper,
+            showSymbol: false,
+            lineStyle: { opacity: 0 },
+            areaStyle: { color: segShade(seg.verdict) },
+            stack: `band-${bi}-${seg.key}`,
+            xAxisIndex: 0,
+            yAxisIndex: 0,
+            z: 1,
+            silent: true,
+            legendHoverLink: false,
+            tooltip: { show: false },
+          });
+          series.push({
+            name: bi === 0 ? '方案目标线' : `方案目标线 ${pl.batch.name}`,
+            type: 'line',
+            data: seg.target_line.map((pt) => [pt.t_s, pt.temp_c]),
+            showSymbol: false,
+            lineStyle: {
+              width: 1.6,
+              color: TARGET_COLOR,
+              type: seg.verdict === 'unevaluated' ? 'dotted' : 'dashed',
+            },
+            xAxisIndex: 0,
+            yAxisIndex: 0,
+            z: 2,
+          });
+        });
+      }
     });
 
     return {
@@ -189,7 +257,7 @@
         valueFormatter: (v) => (v === null || v === undefined ? '缺测' : Number(v).toFixed(1)),
       },
       legend: {
-        data: ['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR'],
+        data: ['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR', '方案目标线', '容差带'],
         textStyle: { color: '#a89b8c' },
         top: 0,
       },

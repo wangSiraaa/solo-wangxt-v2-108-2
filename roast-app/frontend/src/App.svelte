@@ -1,6 +1,8 @@
 <script>
   import { onMount } from 'svelte';
   import RoastChart from './lib/RoastChart.svelte';
+  import PlanPanel from './lib/PlanPanel.svelte';
+  import PlanReview from './lib/PlanReview.svelte';
   import {
     getBatches,
     seed,
@@ -38,6 +40,7 @@
 
   // export verification
   let verifyResult = null;
+  let planPanel;
 
   const phaseKeys = [
     ['drying_s', '脱水期', '下豆 → 回温点'],
@@ -160,6 +163,9 @@
         })),
         events: ex.events,
         params: ex.params,
+        // carry the frozen snapshot: the recomputed plan judgment must match
+        // the stored one even when the plan has since gained new versions
+        plan_snapshot: ex.plan_snapshot,
       });
       const keys = Object.keys(ex.metrics).filter(
         (k) => k.endsWith('_s') || k === 'development_ratio'
@@ -179,7 +185,20 @@
       const sig = (arr) =>
         JSON.stringify(arr.map((p) => [p.t_s, p.bean_temp_c, p.env_temp_c]));
       const rawSame = sig(ex.series.raw_points) === sig(alt.series.raw_points);
-      verifyResult = { rows, rawSame, exportObj: ex };
+      // plan judgment reproducibility from the embedded version snapshot
+      let planSame = null;
+      let planInfo = null;
+      if (ex.plan_snapshot) {
+        planSame =
+          JSON.stringify(rc.recompute_plan_evaluation.result) ===
+          JSON.stringify(ex.plan_evaluation.result);
+        planInfo = {
+          versionNo: ex.plan_snapshot.version_no,
+          sha: ex.plan_snapshot.content_sha256.slice(0, 12),
+          state: ex.plan_evaluation.review_state,
+        };
+      }
+      verifyResult = { rows, rawSame, planSame, planInfo, exportObj: ex };
     } catch (e) {
       error = e.message;
     } finally {
@@ -209,6 +228,12 @@
   function scheduleRefresh() {
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(refresh, 150);
+  }
+
+  async function onPlanChanged() {
+    // plan list and batch bindings changed in PlanPanel
+    await planPanel.reload();
+    await refresh();
   }
 </script>
 
@@ -313,17 +338,27 @@
 
   {#if dataA}
     <section class="panel">
+      <PlanPanel bind:this={planPanel} {batches} bindBatchId={selA}
+        on:changed={onPlanChanged} />
+    </section>
+
+    <section class="panel">
       <RoastChart {chartPayloads} {windowS} {smoothS} />
       <div class="row" style="margin-top:6px;font-size:12px">
         <span class="tag">圆点＝实测豆温</span>
         <span class="tag">虚线菱形＝线性插值（非实测）</span>
         <span class="tag">细点线＝环境温度</span>
         <span class="tag">金色竖虚线＝风门变化</span>
+        <span class="tag">紫色虚线＝方案目标 · 阴影＝±容差带</span>
         <span class="tag">曲线断档＝缺测未桥接</span>
       </div>
       {#if comparePayload}
         <div class="warn" style="margin-top:8px">{comparePayload.interpretation}</div>
       {/if}
+    </section>
+
+    <section class="panel">
+      <PlanReview batchId={selA} planSection={dataA.plan} on:changed={refresh} />
     </section>
 
     <section class="row">
@@ -479,6 +514,19 @@
                 改变窗口/平滑后原始豆温/环温逐点比对：
                 {verifyResult.rawSame ? '✅ 完全不变' : '❌ 被修改'}
               </span>
+              {#if verifyResult.planInfo}
+                <div style="margin-top:4px" class="{verifyResult.planSame ? '' : 'warn'}">
+                  导出携带方案快照
+                  <span class="tag">v{verifyResult.planInfo.versionNo} · {verifyResult.planInfo.sha}…</span>
+                  （判断状态：{verifyResult.planInfo.state === 'current' ? '当前' : verifyResult.planInfo.state}），
+                  从快照独立重算方案偏差：
+                  {verifyResult.planSame ? '✅ 与导出中的存储判断完全一致' : '❌ 不一致'}
+                </div>
+              {:else}
+                <div class="muted" style="margin-top:4px;font-size:12px">
+                  该批次未绑定方案，导出不含方案快照（绑定后会随导出携带版本与偏差结论）。
+                </div>
+              {/if}
               <button class="ghost" style="margin-left:10px" on:click={downloadExport}>
                 下载导出 JSON
               </button>
